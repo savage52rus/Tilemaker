@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Конструктор гексагональных тайлов</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{height:100vh;display:flex;flex-direction:column;font-family:'Segoe UI',system-ui,sans-serif;background:#1e2126;color:#e4e7ec;overflow:hidden}
+  header{display:flex;align-items:center;gap:14px;padding:10px 16px;background:#26292f;border-bottom:1px solid #14161a}
+  header h1{font-size:16px;font-weight:600;flex:1}
+  header .hint{font-size:11px;color:#8b93a1}
+  .btn{border:0;border-radius:6px;padding:7px 14px;font-size:13px;cursor:pointer;background:#3a3f47;color:#e4e7ec}
+  .btn:hover{background:#464c55}
+  .btn:disabled{opacity:.35;cursor:default}
+  .btn:disabled:hover{background:#3a3f47}
+  .btn.primary{background:#4f7dd9}.btn.primary:hover{background:#5f8ce6}
+  .btn.danger:hover{background:#a04b4b}
+  #main{flex:1;display:flex;min-height:0}
+  aside{width:236px;flex-shrink:0;overflow-y:auto;background:#26292f;padding:12px;border-right:1px solid #14161a}
+  .group{margin-bottom:16px}
+  .group h3{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#8b93a1;margin-bottom:7px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+  .grid2 h3{grid-column:1/-1}
+  .tool{display:flex;align-items:center;gap:7px;border:1px solid transparent;border-radius:7px;padding:6px 8px;background:#31353c;cursor:pointer;font-size:12.5px;color:#e4e7ec;text-align:left;width:100%}
+  .tool:hover{background:#3b4048}
+  .tool.active{border-color:#5b8def;background:#3a4356}
+  .chip{width:15px;height:15px;border-radius:4px;flex-shrink:0;border:1px solid rgba(0,0,0,.4)}
+  #canvasWrap{flex:1;position:relative;overflow:hidden;background:#20232a}
+  canvas{display:block;cursor:crosshair}
+</style>
+</head>
+<body>
+<header>
+  <h1>Конструктор гексагональных тайлов</h1>
+  <span class="hint">ЛКМ — рисовать · ПКМ — убрать стену · колесо — зум · средняя кнопка / пробел — сдвиг · Ctrl+Z / Ctrl+Y — отмена и повтор</span>
+  <button class="btn" id="btnUndo" disabled>↩ Отменить</button>
+  <button class="btn" id="btnRedo" disabled>↪ Повторить</button>
+  <button class="btn danger" id="btnClear">Очистить</button>
+  <button class="btn primary" id="btnExport">Сохранить PNG</button>
+</header>
+<div id="main">
+  <aside id="panel"></aside>
+  <div id="canvasWrap"><canvas id="cv"></canvas></div>
+</div>
+<script>
+'use strict';
+const canvas = document.getElementById('cv');
+const ctx = canvas.getContext('2d');
+const wrap = document.getElementById('canvasWrap');
+
+const R = 50, SQ3 = Math.sqrt(3);
+const DIR = [[1,-1],[1,0],[0,1],[-1,1],[-1,0],[0,-1]];
+
+const TERRAINS = [
+  {id:'grass', name:'Трава',  base:'#79a24f'},
+  {id:'dirt',  name:'Земля',  base:'#8a6b47'},
+  {id:'stone', name:'Камень', base:'#9a968c'},
+  {id:'sand',  name:'Песок',  base:'#d9c07a'},
+  {id:'wood',  name:'Доски',  base:'#a97c42'},
+  {id:'water', name:'Вода',   base:'#4a7fa5'},
+];
+const DECOS = [
+  {id:'bones',  name:'Кости',          chip:'#e8e2d0'},
+  {id:'shards', name:'Обломки вазы',   chip:'#cbb28b'},
+  {id:'blood',  name:'Следы крови',    chip:'#7a1515'},
+  {id:'torch',  name:'Потухший факел', chip:'#4a3a28'},
+];
+
+let tool = 'terrain', terrain = 'grass';
+let tiles = new Map();   // "q,r" -> id поверхности
+let walls = new Map();   // ключ грани -> {a,b,type:'wall'|'door'}
+let decos = [];          // {q,r,x,y,type,seed}
+
+let view = {x:0, y:0, z:1};
+let hoverHex = null, hoverEdge = null, hoverDeco = -1;
+let spaceHeld = false, painting = false, panning = false, panStart = null;
+let pendingSnapshot = null;
+
+/* ---------- Геометрия ---------- */
+function hexCenter(q,r){ return [R*SQ3*(q + r/2), R*1.5*r]; }
+function hexVerts(q,r){
+  const [cx,cy] = hexCenter(q,r), v = [];
+  for(let i=0;i<6;i++){
+    const a = Math.PI/180*(60*i - 30);
+    v.push([cx + R*Math.cos(a), cy + R*Math.sin(a)]);
+  }
+  return v;
+}
+function hexPath(g,v){
+  g.beginPath(); g.moveTo(v[0][0],v[0][1]);
+  for(let i=1;i<6;i++) g.lineTo(v[i][0],v[i][1]);
+  g.closePath();
+}
+function pixelToAxial(x,y){
+  let q = (SQ3/3*x - 1/3*y)/R, r = (2/3*y)/R;
+  const s = -q - r;
+  let rq = Math.round(q), rr = Math.round(r), rs = Math.round(s);
+  const dq = Math.abs(rq-q), dr = Math.abs(rr-r), ds = Math.abs(rs-s);
+  if(dq > dr && dq > ds) rq = -rr - rs; else if(dr > ds) rr = -rq - rs;
+  return [rq,rr];
+}
+function edgeId(q,r,i){
+  const n = DIR[i];
+  const ka = q+','+r, kb = (q+n[0])+','+(r+n[1]);
+  return ka < kb ? ka+'|'+kb : kb+'|'+ka;
+}
+function distToSeg(px,py,ax,ay,bx,by){
+  const dx = bx-ax, dy = by-ay, L2 = dx*dx + dy*dy;
+  let t = L2 ? ((px-ax)*dx + (py-ay)*dy)/L2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px-(ax+dx*t), py-(ay+dy*t));
+}
+function nearestEdge(px,py,maxD){
+  let best = null;
+  for(const [key] of tiles){
+    const [q,r] = key.split(',').map(Number);
+    const v = hexVerts(q,r);
+    for(let i=0;i<6;i++){
+      const a = v[(i+5)%6], b = v[i];
+      const d = distToSeg(px,py,a[0],a[1],b[0],b[1]);
+      if(d <= maxD && (!best || d < best.d)) best = {key:edgeId(q,r,i), a, b, d};
+    }
+  }
+  return best;
+}
+
+/* ---------- Псевдослучайность ---------- */
+function hash2(q,r){ let h = q*374761393 + r*668265263; h = (h ^ (h>>>13))*1274126177; return (h ^ (h>>>16))>>>0; }
+function mulberry32(a){ return function(){ a|=0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a>>>15, 1|a); t = t + Math.imul(t ^ t>>>7, 61|t) ^ t; return ((t ^ t>>>14)>>>0)/4294967296; }; }
+
+/* ---------- Поверхности ---------- */
+const TEX = {
+  grass(g,cx,cy,rnd){
+    g.fillStyle = 'rgba(40,70,20,.18)';
+    for(let i=0;i<6;i++){
+      g.beginPath();
+      g.ellipse(cx+(rnd()-.5)*R*1.6, cy+(rnd()-.5)*R*1.6, 8+rnd()*10, 5+rnd()*7, rnd()*3, 0, 7);
+      g.fill();
+    }
+    g.strokeStyle = '#4f7230'; g.lineWidth = 1.6; g.lineCap = 'round';
+    for(let i=0;i<22;i++){
+      const x = cx+(rnd()-.5)*R*1.7, y = cy+(rnd()-.5)*R*1.7;
+      g.beginPath(); g.moveTo(x,y); g.lineTo(x+(rnd()-.5)*3, y-4-rnd()*4); g.stroke();
+    }
+  },
+  dirt(g,cx,cy,rnd){
+    g.fillStyle = 'rgba(60,42,25,.25)';
+    for(let i=0;i<26;i++){ g.beginPath(); g.arc(cx+(rnd()-.5)*R*1.7, cy+(rnd()-.5)*R*1.7, 1+rnd()*2.5, 0, 7); g.fill(); }
+    g.fillStyle = 'rgba(205,195,175,.35)';
+    for(let i=0;i<5;i++){ g.beginPath(); g.arc(cx+(rnd()-.5)*R*1.5, cy+(rnd()-.5)*R*1.5, 2+rnd()*2.5, 0, 7); g.fill(); }
+  },
+  stone(g,cx,cy,rnd){
+    g.strokeStyle = 'rgba(70,68,60,.55)'; g.lineWidth = 1.4;
+    for(let i=0;i<6;i++){
+      let x = cx+(rnd()-.5)*R*1.5, y = cy+(rnd()-.5)*R*1.5;
+      g.beginPath(); g.moveTo(x,y);
+      for(let k=0;k<3;k++){ x += (rnd()-.5)*24; y += (rnd()-.5)*24; g.lineTo(x,y); }
+      g.stroke();
+    }
+    g.fillStyle = 'rgba(255,255,255,.10)';
+    for(let i=0;i<4;i++) g.fillRect(cx+(rnd()-.5)*R*1.4, cy+(rnd()-.5)*R*1.4, 10+rnd()*14, 4+rnd()*6);
+  },
+  sand(g,cx,cy,rnd){
+    g.fillStyle = 'rgba(180,150,80,.5)';
+    for(let i=0;i<40;i++){ g.beginPath(); g.arc(cx+(rnd()-.5)*R*1.8, cy+(rnd()-.5)*R*1.8, .8+rnd()*1.2, 0, 7); g.fill(); }
+    g.strokeStyle = 'rgba(160,130,70,.4)'; g.lineWidth = 1;
+    for(let i=0;i<5;i++){
+      const y = cy+(rnd()-.5)*R*1.6;
+      g.beginPath(); g.moveTo(cx-R, y); g.quadraticCurveTo(cx, y+(rnd()-.5)*8, cx+R, y+(rnd()-.5)*8); g.stroke();
+    }
+  },
+  wood(g,cx,cy,rnd){
+    g.strokeStyle = 'rgba(60,38,15,.55)'; g.lineWidth = 1.6;
+    for(let k=-3;k<=3;k++){
+      const y = cy + k*13;
+      g.beginPath(); g.moveTo(cx-R, y+(rnd()-.5)*3); g.lineTo(cx+R, y+(rnd()-.5)*3); g.stroke();
+    }
+    g.fillStyle = 'rgba(60,38,15,.5)';
+    for(let i=0;i<8;i++){ g.beginPath(); g.arc(cx+(rnd()-.5)*R*1.6, cy+(rnd()-.5)*R*1.6, 1.2, 0, 7); g.fill(); }
+  },
+  water(g,cx,cy,rnd){
+    g.strokeStyle = 'rgba(200,225,240,.45)'; g.lineWidth = 1.6; g.lineCap = 'round';
+    for(let i=0;i<7;i++){
+      const y = cy+(rnd()-.5)*R*1.7, x0 = cx+(rnd()-.5)*R*1.4;
+      g.beginPath(); g.moveTo(x0,y);
+      g.quadraticCurveTo(x0+7, y-4, x0+14, y);
+      g.quadraticCurveTo(x0+21, y+4, x0+28, y);
+      g.stroke();
+    }
+  },
+};
+
+function drawTile(g,q,r,terrId){
+  const terr = TERRAINS.find(t=>t.id===terrId) || TERRAINS[0];
+  const v = hexVerts(q,r), [cx,cy] = hexCenter(q,r);
+  g.save();
+  hexPath(g,v); g.clip();
+  g.fillStyle = terr.base; g.fill();
+  (TEX[terrId]||(()=>{}))(g,cx,cy,mulberry32(hash2(q,r)));
+  g.restore();
+}
+
+/* ---------- Стены и двери ---------- */
+function drawWall(g,w){
+  const [ax,ay]=w.a, [bx,by]=w.b;
+  const dx = bx-ax, dy = by-ay, L = Math.hypot(dx,dy)||1;
+  const ux = dx/L, uy = dy/L, px = -uy, py = ux;
+  g.save(); g.lineCap = 'butt';
+  if(w.type === 'door'){
+    const half = 9, mx = (ax+bx)/2, my = (ay+by)/2;
+    g.strokeStyle = '#4d4136'; g.lineWidth = 7;
+    g.beginPath();
+    g.moveTo(ax,ay); g.lineTo(mx-ux*half, my-uy*half);
+    g.moveTo(mx+ux*half, my+uy*half); g.lineTo(bx,by);
+    g.stroke();
+    g.beginPath();
+    g.moveTo(mx-ux*half+px*3.5, my-uy*half+py*3.5); g.lineTo(mx-ux*half-px*3.5, my-uy*half-py*3.5);
+    g.moveTo(mx+ux*half+px*3.5, my+uy*half+py*3.5); g.lineTo(mx+ux*half-px*3.5, my+uy*half-py*3.5);
+    g.stroke();
+    g.strokeStyle = '#7a6a58'; g.lineWidth = 2.5;
+    g.beginPath(); g.moveTo(mx-ux*half, my-uy*half); g.lineTo(mx+ux*half, my+uy*half); g.stroke();
+    const ang = 1.15;
+    const lx = ux*Math.cos(ang)-uy*Math.sin(ang), ly = ux*Math.sin(ang)+uy*Math.cos(ang);
+    const hx = mx-ux*half, hy = my-uy*half;
+    g.strokeStyle = '#7c552e'; g.lineWidth = 4.5; g.lineCap = 'round';
+    g.beginPath(); g.moveTo(hx,hy); g.lineTo(hx+lx*half*1.8, hy+ly*half*1.8); g.stroke();
+    g.fillStyle = '#d8b46a';
+    g.beginPath(); g.arc(hx+lx*half*1.8, hy+ly*half*1.8, 2, 0, 7); g.fill();
+  } else {
+    g.strokeStyle = '#4d4136'; g.lineWidth = 7;
+    g.beginPath(); g.moveTo(ax,ay); g.lineTo(bx,by); g.stroke();
+    g.strokeStyle = 'rgba(255,255,255,.14)'; g.lineWidth = 2;
+    g.beginPath(); g.moveTo(ax+px*1.6, ay+py*1.6); g.lineTo(bx+px*1.6, by+py*1.6); g.stroke();
+  }
+  g.restore();
+}
+
+/* ---------- Украшения ---------- */
+function drawDeco(g,d){
+  g.save(); g.translate(d.x, d.y);
+  if(d.type==='bones') drawBones(g,d);
+  else if(d.type==='shards') drawShards(g,d);
+  else if(d.type==='blood') drawBlood(g,d);
+  else if(d.type==='torch') drawTorch(g,d);
+  g.restore();
+}
+function drawBones(g,d){
+  const rnd = mulberry32(d.seed);
+  g.save(); g.rotate((rnd()-.5)*1.2);
+  g.strokeStyle = '#e9e3d2'; g.fillStyle = '#e9e3d2'; g.lineWidth = 3.4; g.lineCap = 'round';
+  for(let k=0;k<2;k++){
+    const ang = (k ? 0.9 : -0.5) + (rnd()-.5)*0.6, len = 13+rnd()*7;
+    g.save(); g.translate((rnd()-.5)*8, (rnd()-.5)*8); g.rotate(ang);
+    g.beginPath(); g.moveTo(-len/2,0); g.lineTo(len/2,0); g.stroke();
+    for(const sx of [-1,1]) for(const sy of [-1,1]){ g.beginPath(); g.arc(sx*len/2, sy*2.1, 2.5, 0, 7); g.fill(); }
+    g.restore();
+  }
+  g.fillStyle = '#e9e3d2'; g.beginPath(); g.arc(0,0,6,0,7); g.fill();
+  g.strokeStyle = '#b9b09a'; g.lineWidth = 1;
+  g.beginPath(); g.arc(0,0,6,0,7); g.stroke();
+  g.fillStyle = '#2c2620';
+  g.beginPath(); g.arc(-2.2,-1.5,1.5,0,7); g.fill();
+  g.beginPath(); g.arc(2.2,-1.5,1.5,0,7); g.fill();
+  g.fillStyle = '#d8cfb8';
+  g.beginPath(); g.moveTo(-3,4.5); g.lineTo(3,4.5); g.lineTo(1.5,7.5); g.lineTo(-1.5,7.5); g.closePath(); g.fill();
+  g.restore();
+}
+function drawShards(g,d){
+  const rnd = mulberry32(d.seed);
+  const n = 3 + Math.floor(rnd()*3);
+  for(let i=0;i<n;i++){
+    const a = rnd()*6.28, dist = 3+rnd()*9, s = 3+rnd()*5;
+    g.save(); g.translate(Math.cos(a)*dist, Math.sin(a)*dist); g.rotate(rnd()*6.28);
+    g.fillStyle = '#cbb28b'; g.strokeStyle = '#8f774f'; g.lineWidth = 1.1;
+    g.beginPath();
+    g.moveTo(-s, -s*0.4);
+    g.lineTo(s*(0.5+rnd()*0.6), -s*0.7);
+    g.lineTo(s*0.3, s*(0.5+rnd()*0.5));
+    g.closePath(); g.fill(); g.stroke();
+    g.strokeStyle = 'rgba(139,111,79,.8)';
+    g.beginPath(); g.moveTo(-s*0.5,-s*0.1); g.lineTo(s*0.2, s*0.2); g.stroke();
+    g.restore();
+  }
+}
+function drawBlood(g,d){
+  const rnd = mulberry32(d.seed);
+  g.save(); g.rotate(rnd()*6.28);
+  g.fillStyle = 'rgba(110,18,18,.8)';
+  g.beginPath();
+  for(let i=0;i<=12;i++){
+    const a = i/12*6.283, rr = 4+rnd()*4;
+    const x = Math.cos(a)*rr, y = Math.sin(a)*rr*0.8;
+    i ? g.lineTo(x,y) : g.moveTo(x,y);
+  }
+  g.closePath(); g.fill();
+  g.fillStyle = 'rgba(110,18,18,.65)';
+  for(let i=0;i<4;i++){
+    const a = rnd()*6.28, dist = 9+rnd()*10;
+    g.beginPath(); g.arc(Math.cos(a)*dist, Math.sin(a)*dist, 1+rnd()*1.6, 0, 7); g.fill();
+  }
+  g.restore();
+}
+function drawTorch(g,d){
+  const rnd = mulberry32(d.seed);
+  g.save();
+  g.strokeStyle = '#6b4a26'; g.lineWidth = 4; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(-1,10); g.lineTo(2,-6); g.stroke();
+  g.fillStyle = '#3d2c1a';
+  g.beginPath(); g.ellipse(2.4,-8,4.6,5.4,0.2,0,7); g.fill();
+  g.fillStyle = 'rgba(20,14,8,.9)';
+  g.beginPath(); g.ellipse(2.4,-9.5,3.2,3.6,0.2,0,7); g.fill();
+  g.strokeStyle = 'rgba(60,60,60,.55)'; g.lineWidth = 2.4;
+  g.beginPath(); g.moveTo(2,-15); g.quadraticCurveTo(5+rnd()*3,-20, 2+rnd()*4,-25); g.stroke();
+  g.fillStyle = 'rgba(40,40,40,.4)';
+  g.beginPath(); g.ellipse(0,11,6,2.6,0,0,7); g.fill();
+  g.restore();
+}
+
+/* ---------- Отрисовка сцены ---------- */
+function renderScene(g, opts){
+  for(const [key,t] of tiles){
+    const [q,r] = key.split(',').map(Number);
+    drawTile(g,q,r,t);
+  }
+  if(opts.showGrid){
+    g.strokeStyle = 'rgba(0,0,0,.28)'; g.lineWidth = 1;
+    for(const [key] of tiles){
+      const [q,r] = key.split(',').map(Number);
+      hexPath(g, hexVerts(q,r)); g.stroke();
+    }
+  }
+  for(const w of walls.values()) drawWall(g,w);
+  for(const d of decos) drawDeco(g,d);
+
+  if(opts.hoverHex){
+    const [q,r] = opts.hoverHex.split(',').map(Number);
+    const v = hexVerts(q,r);
+    hexPath(g,v);
+    if(tiles.has(opts.hoverHex)){
+      g.strokeStyle = 'rgba(255,255,255,.75)'; g.lineWidth = 2; g.stroke();
+    } else if(opts.tool === 'terrain'){
+      const terr = TERRAINS.find(t=>t.id===terrain);
+      g.setLineDash([6,4]);
+      g.strokeStyle = terr ? terr.base : '#fff'; g.lineWidth = 2.5;
+      g.stroke(); g.setLineDash([]);
+    }
+  }
+  if(opts.hoverEdge){
+    g.strokeStyle = 'rgba(255,255,255,.85)'; g.lineWidth = 3; g.lineCap = 'round';
+    g.beginPath();
+    g.moveTo(opts.hoverEdge.a[0], opts.hoverEdge.a[1]);
+    g.lineTo(opts.hoverEdge.b[0], opts.hoverEdge.b[1]);
+    g.stroke();
+  }
+  if(opts.hoverDeco >= 0 && decos[opts.hoverDeco]){
+    const d = decos[opts.hoverDeco];
+    g.strokeStyle = 'rgba(255,255,255,.8)'; g.lineWidth = 1.5;
+    g.beginPath(); g.arc(d.x, d.y, 13, 0, 7); g.stroke();
+  }
+}
+
+function draw(){
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle = '#23262c';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.setTransform(dpr*view.z, 0, 0, dpr*view.z, dpr*view.x, dpr*view.y);
+  renderScene(ctx, {showGrid:true, hoverHex, hoverEdge, hoverDeco, tool});
+}
+
+/* ---------- История (undo / redo) ---------- */
+const MAXH = 60;
+let undoStack = [], redoStack = [];
+const btnUndo = document.getElementById('btnUndo');
+const btnRedo = document.getElementById('btnRedo');
+
+function snapshot(){
+  return {
+    t: [...tiles],
+    w: [...walls].map(([k,v])=>[k,{...v}]),
+    d: decos.map(d=>({...d})),
+  };
+}
+function restore(s){
+  tiles = new Map(s.t);
+  walls = new Map(s.w);
+  decos = s.d.slice();
+}
+function updateHist(){
+  btnUndo.disabled = !undoStack.length;
+  btnRedo.disabled = !redoStack.length;
+}
+// Фиксирует шаг истории: если состояние изменилось с момента before — в стек отмены
+function commitIfChanged(before){
+  if(!before) return;
+  if(JSON.stringify(snapshot()) !== JSON.stringify(before)){
+    undoStack.push(before);
+    if(undoStack.length > MAXH) undoStack.shift();
+    redoStack.length = 0;
+    updateHist();
+  }
+}
+function undo(){
+  if(!undoStack.length) return;
+  const now = snapshot();
+  restore(undoStack.pop());
+  redoStack.push(now);
+  updateHist(); draw();
+}
+function redo(){
+  if(!redoStack.length) return;
+  const now = snapshot();
+  restore(redoStack.pop());
+  undoStack.push(now);
+  updateHist(); draw();
+}
+
+/* ---------- Действия ---------- */
+function applyTool(wx,wy){
+  const key = pixelToAxial(wx,wy).join(',');
+  const [q,r] = key.split(',').map(Number);
+  if(tool === 'terrain'){
+    tiles.set(key, terrain);
+  } else if(tool === 'wall'){
+    const ed = nearestEdge(wx,wy, 9/view.z);
+    if(!ed) return;
+    const cur = walls.get(ed.key);
+    if(!cur) walls.set(ed.key, {a:ed.a, b:ed.b, type:'wall'});
+    else if(cur.type === 'wall') cur.type = 'door';
+    else walls.delete(ed.key);
+  } else if(DECOS.some(d=>d.id===tool)){
+    if(!tiles.has(key)) tiles.set(key, terrain);
+    decos.push({q, r, x:wx, y:wy, type:tool, seed:(Math.random()*1e9)|0});
+  } else if(tool === 'erase'){
+    let bi = -1, bd = 14/view.z;
+    for(let i=0;i<decos.length;i++){
+      const d = Math.hypot(decos[i].x-wx, decos[i].y-wy);
+      if(d < bd){ bd = d; bi = i; }
+    }
+    if(bi >= 0){ decos.splice(bi,1); return; }
+    if(tiles.has(key)){
+      tiles.delete(key);
+      for(let i=decos.length-1;i>=0;i--) if(decos[i].q===q && decos[i].r===r) decos.splice(i,1);
+      for(let i=0;i<6;i++){
+        const n = DIR[i];
+        if(!tiles.has((q+n[0])+','+(r+n[1]))) walls.delete(edgeId(q,r,i));
+      }
+    }
+  } else if(tool === 'exportTile'){
+    if(!tiles.has(key)){ alert('Этот гекс пуст — сначала выберите поверхность'); return; }
+    exportSingleTile(q,r);
+  }
+}
+
+/* ---------- Экспорт всей карты ---------- */
+function exportPNG(){
+  if(!tiles.size){ alert('Сначала добавьте хотя бы один тайл'); return; }
+  let minX=1e9, minY=1e9, maxX=-1e9, maxY=-1e9;
+  for(const [key] of tiles){
+    const [q,r] = key.split(',').map(Number);
+    for(const [x,y] of hexVerts(q,r)){
+      minX = Math.min(minX,x); maxX = Math.max(maxX,x);
+      minY = Math.min(minY,y); maxY = Math.max(maxY,y);
+    }
+  }
+  const scale = 2, pad = 10;
+  const off = document.createElement('canvas');
+  off.width  = Math.ceil((maxX-minX+pad*2)*scale);
+  off.height = Math.ceil((maxY-minY+pad*2)*scale);
+  const g = off.getContext('2d');
+  g.setTransform(scale,0,0,scale, scale*(pad-minX), scale*(pad-minY));
+  renderScene(g, {});
+  const a = document.createElement('a');
+  a.download = 'hex-tiles.png';
+  a.href = off.toDataURL('image/png');
+  a.click();
+}
+
+/* ---------- Экспорт одного тайла ---------- */
+function exportSingleTile(q,r){
+  const key = q+','+r;
+  const v = hexVerts(q,r);
+  let minX=1e9, minY=1e9, maxX=-1e9, maxY=-1e9;
+  for(const [x,y] of v){
+    minX = Math.min(minX,x); maxX = Math.max(maxX,x);
+    minY = Math.min(minY,y); maxY = Math.max(maxY,y);
+  }
+  const scale = 3, pad = 5; // запас под толщину стен и контур
+  const off = document.createElement('canvas');
+  off.width  = Math.ceil((maxX-minX+pad*2)*scale);
+  off.height = Math.ceil((maxY-minY+pad*2)*scale);
+  const g = off.getContext('2d');
+  g.setTransform(scale,0,0,scale, scale*(pad-minX), scale*(pad-minY));
+
+  // всё внутри контура гекса, фон прозрачный
+  g.save();
+  hexPath(g,v); g.clip();
+  drawTile(g,q,r,tiles.get(key));
+  for(const [wkey,w] of walls){
+    const [p1,p2] = wkey.split('|').map(s=>s.split(',').map(Number));
+    if((p1[0]===q && p1[1]===r) || (p2[0]===q && p2[1]===r)) drawWall(g,w);
+  }
+  for(const d of decos) if(d.q===q && d.r===r) drawDeco(g,d);
+  g.restore();
+
+  // аккуратный контур по краю тайла
+  g.strokeStyle = 'rgba(30,26,20,.55)'; g.lineWidth = 2;
+  hexPath(g,v); g.stroke();
+
+  const a = document.createElement('a');
+  a.download = 'hex-tile-'+q+'_'+r+'.png';
+  a.href = off.toDataURL('image/png');
+  a.click();
+}
+
+/* ---------- Панель инструментов ---------- */
+const panel = document.getElementById('panel');
+function section(title, grid){
+  const d = document.createElement('div');
+  d.className = 'group' + (grid ? ' grid2' : '');
+  const h = document.createElement('h3'); h.textContent = title;
+  d.appendChild(h); panel.appendChild(d); return d;
+}
+function mkBtn(parent, label, color, t){
+  const b = document.createElement('button');
+  b.className = 'tool'; b.dataset.t = t;
+  b.innerHTML = color ? `<span class="chip" style="background:${color}"></span>${label}` : label;
+  b.addEventListener('click', ()=>setTool(t));
+  parent.appendChild(b);
+}
+const gT = section('Поверхность', true);
+TERRAINS.forEach(t=>{
+  const b = document.createElement('button');
+  b.className = 'tool'; b.dataset.t = 'terrain'; b.dataset.v = t.id;
+  b.innerHTML = `<span class="chip" style="background:${t.base}"></span>${t.name}`;
+  b.addEventListener('click', ()=>setTool('terrain', t.id));
+  gT.appendChild(b);
+});
+const gW = section('Стены');
+mkBtn(gW, 'Стена / дверь (цикл)', '#4d4136', 'wall');
+const gD = section('Украшения');
+DECOS.forEach(d=> mkBtn(gD, d.name, d.chip, d.id));
+const gE = section('Прочее');
+mkBtn(gE, 'Экспорт тайла', null, 'exportTile');
+mkBtn(gE, 'Ластик', null, 'erase');
+
+function setTool(t, v){
+  tool = t;
+  if(t === 'terrain' && v) terrain = v;
+  document.querySelectorAll('#panel .tool').forEach(b=>{
+    b.classList.toggle('active', b.dataset.t === tool && (tool !== 'terrain' || b.dataset.v === terrain));
+  });
+}
+
+/* ---------- События ---------- */
+function toWorld(sx,sy){ return [(sx - view.x)/view.z, (sy - view.y)/view.z]; }
+
+canvas.addEventListener('contextmenu', e=>e.preventDefault());
+canvas.addEventListener('mousedown', e=>{
+  const [wx,wy] = toWorld(e.offsetX, e.offsetY);
+  if(e.button === 1 || spaceHeld){
+    panning = true; panStart = [e.clientX, e.clientY, view.x, view.y];
+    e.preventDefault(); return;
+  }
+  if(e.button === 0){
+    pendingSnapshot = snapshot();   // состояние до действия
+    painting = true;
+    applyTool(wx,wy);
+  }
+  if(e.button === 2){
+    const before = snapshot();
+    const ed = nearestEdge(wx,wy, 9/view.z);
+    if(ed) walls.delete(ed.key);
+    commitIfChanged(before);
+  }
+  draw();
+});
+window.addEventListener('mouseup', ()=>{
+  if(painting){
+    commitIfChanged(pendingSnapshot); // шаг в историю, только если что-то реально изменилось
+    pendingSnapshot = null;
+  }
+  painting = false; panning = false;
+});
+canvas.addEventListener('mousemove', e=>{
+  if(panning){
+    view.x = panStart[2] + e.clientX - panStart[0];
+    view.y = panStart[3] + e.clientY - panStart[1];
+    draw(); return;
+  }
+  const [wx,wy] = toWorld(e.offsetX, e.offsetY);
+  hoverHex = null; hoverEdge = null; hoverDeco = -1;
+  const key = pixelToAxial(wx,wy).join(',');
+  if(tool === 'wall'){
+    hoverEdge = nearestEdge(wx,wy, 9/view.z);
+  } else if(tool === 'erase'){
+    let bd = 14/view.z;
+    for(let i=0;i<decos.length;i++){
+      const d = Math.hypot(decos[i].x-wx, decos[i].y-wy);
+      if(d < bd){ bd = d; hoverDeco = i; }
+    }
+    if(hoverDeco < 0 && tiles.has(key)) hoverHex = key;
+  } else {
+    hoverHex = key;
+  }
+  if(painting && tool === 'terrain') applyTool(wx,wy);
+  draw();
+});
+canvas.addEventListener('mouseleave', ()=>{ hoverHex=null; hoverEdge=null; hoverDeco=-1; painting=false; draw(); });
+canvas.addEventListener('wheel', e=>{
+  e.preventDefault();
+  const nz = Math.max(.35, Math.min(2.6, view.z * (e.deltaY < 0 ? 1.12 : 1/1.12)));
+  const [wx,wy] = toWorld(e.offsetX, e.offsetY);
+  view.x = e.offsetX - wx*nz;
+  view.y = e.offsetY - wy*nz;
+  view.z = nz;
+  draw();
+}, {passive:false});
+window.addEventListener('keydown', e=>{
+  if(e.code==='Space'){ spaceHeld = true; e.preventDefault(); }
+  if((e.ctrlKey || e.metaKey) && !e.shiftKey && e.code==='KeyZ'){ e.preventDefault(); undo(); }
+  if((e.ctrlKey || e.metaKey) && (e.code==='KeyY' || (e.shiftKey && e.code==='KeyZ'))){ e.preventDefault(); redo(); }
+});
+window.addEventListener('keyup', e=>{ if(e.code==='Space') spaceHeld = false; });
+
+btnUndo.addEventListener('click', undo);
+btnRedo.addEventListener('click', redo);
+document.getElementById('btnExport').addEventListener('click', exportPNG);
+document.getElementById('btnClear').addEventListener('click', ()=>{
+  if(confirm('Удалить всю карту?')){
+    const before = snapshot();
+    tiles.clear(); walls.clear(); decos.length = 0;
+    commitIfChanged(before);
+    draw();
+  }
+});
+
+/* ---------- Инициализация ---------- */
+function resize(){
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = wrap.clientWidth * dpr;
+  canvas.height = wrap.clientHeight * dpr;
+  canvas.style.width  = wrap.clientWidth + 'px';
+  canvas.style.height = wrap.clientHeight + 'px';
+  draw();
+}
+window.addEventListener('resize', resize);
+tiles.set('0,0','grass');
+view.x = wrap.clientWidth/2;
+view.y = wrap.clientHeight/2;
+setTool('terrain','grass');
+resize();
+</script>
+</body>
+</html>
